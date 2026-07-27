@@ -1,0 +1,12 @@
+[package]
+name = "s3tap-schema"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"   # only the tests serialize here; consumers bring their own

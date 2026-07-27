@@ -1,0 +1,13 @@
+[package]
+name = "s3tap-core"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+s3tap-events = { path = "../s3tap-events" }   # raw event input
+s3tap-schema = { path = "../s3tap-schema" }   # Operation record output
+
+[dev-dependencies]
+serde_json = "1"   # end-to-end pipeline test serializes the record

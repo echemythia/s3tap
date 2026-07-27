@@ -1,0 +1,12 @@
+[package]
+name = "s3tap-events"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# zerocopy: safe, zero-copy decode of raw ring-buffer bytes into our repr(C)
+# structs. FromBytes (unlike bytemuck::Pod) allows the structs' internal
+# padding, so it works for EvtTcpConnect's padded layout.
+zerocopy = { version = "0.8", features = ["derive"] }

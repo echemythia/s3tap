@@ -1,0 +1,15 @@
+[book]
+title = "s3tap"
+description = "Observe and judge an application's S3 traffic with eBPF — capture, then a health verdict."
+authors = ["Nikolaos Papanikos"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+git-repository-url = "https://github.com/echemythia/s3tap"
+edit-url-template = "https://github.com/echemythia/s3tap/edit/main/book/{path}"
+
+[output.html.fold]
+enable = true
+level = 1

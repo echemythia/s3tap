@@ -1,0 +1,19 @@
+[package]
+name = "s3tap-doctor"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+
+# A PURE CONSUMER of the public records (open side of the schema seam): it reads
+# s3tap.operation/1 + s3tap.connection/2 JSONL and judges health relative to the RTT
+# floor. No kernel, no aya — so it
+# unit-tests on canned fixtures without root. demo/s3stats.py is the reference oracle.
+[dependencies]
+s3tap-schema = { path = "../s3tap-schema" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# the parity test builds fixtures from the schema types and pipes them to s3stats.py
+serde_json = "1"

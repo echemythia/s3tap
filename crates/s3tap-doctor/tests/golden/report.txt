@@ -1,0 +1,16 @@
+  are these numbers healthy? (each span vs the round-trip floor)
+  environment: uncertain — WAN / on-premises (or cross-region) — srtt 17.0 ms, a long floor; cross-region EC2 and WAN/on-prem overlap here (check the endpoint's region to tell them apart)
+  baseline RTT (srtt)   17.0 ms    floor     the network round-trip floor — every span below is judged against it
+  TCP connect           17.0 ms  ✓ expected  ≈1.0×RTT — a single SYN/SYN-ACK, as expected
+  TTFB, new conn        50.0 ms  ✓ expected  2.9×RTT — request round-trip + server think (excludes setup)
+  TTFB, reused conn     34.0 ms  ✓ good      2.0×RTT — setup already paid; reuse avoids ~17.0 ms tcp_connect/op (+ TLS)
+  retransmit rate         0.00%  ✓ clean     no real loss on the path (0 retransmit(s) / ~684 segs — TLP and spurious retransmits are counted here, absorbed by the 0.1% tolerance)
+  HTTP errors             2 / 8  ⚠ errors    status >=400: 503, 403
+  connection reuse          88%  ✓ good      7/8 ops reused a connection — high reuse avoids repeated TCP+TLS setup
+  S3 operations (per op-class):
+  GetObject TTFB        35.0 ms  ✓ expected  think-time ≈ 18.0 ms (2.1×RTT) — S3 server work, not the network
+  throttling (429/503)        1  ⚠ throttle  429/503 — throttling (back off + spread keys across prefixes); a 503 may instead be a transient ServiceUnavailable, s3_error_code not yet emitted to disambiguate
+  client errors (4xx)         1  ⚠ client    4xx — a client/permission/signing bug, not the network
+
+  verdict: ATTENTION — one or more metrics are outside the expected envelope (⚠ above)
+  (judged 6 of 8 operations)

@@ -1,0 +1,14 @@
+[package]
+name = "s3tap-replay"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+[[bin]]
+name = "s3tap-replay"
+path = "src/bin/replay.rs"

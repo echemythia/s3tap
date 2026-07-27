@@ -1,0 +1,89 @@
+name: docs
+
+# Build the mdBook site under book/ and publish it to GitHub Pages.
+# The CLI reference (book/src/reference/cli.md) is committed — regenerate it locally with
+# `cargo build -p s3tap && book/gen-cli-reference.sh` after a CLI change. CI does not build the
+# eBPF binary; it only renders the committed markdown.
+
+on:
+  push:
+    branches: [main]
+    paths: ["book/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+# NO workflow-level permissions block on purpose. A workflow-level grant lands in EVERY
+# job, and `build` compiles mdBook's whole crates.io dependency tree: ~200 build scripts and
+# proc-macros, any of which is arbitrary code from a third party. With id-token:write in
+# that job's environment those build scripts get ACTIONS_ID_TOKEN_REQUEST_URL/_TOKEN and can
+# mint a GitHub OIDC token asserting THIS repo to any relying party, and with pages:write
+# they can publish arbitrary content to the site that serves our install instructions. The
+# build job needs neither. Each job below asks for exactly what it uses.
+
+# One deploy at a time; don't cancel an in-flight publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+# `actions/*` is left on its major tag elsewhere in this repo (see ci.yml), but the three
+# Pages actions are pinned to a commit SHA: they are the steps that hold pages:write and
+# id-token:write and that decide what bytes the published site serves, which is where the
+# install instructions live. The trailing comment records which release each SHA is.
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Read the source. Nothing here publishes or signs anything, so no pages:write and
+    # emphatically no id-token:write (see the note above the concurrency block).
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install mdBook
+        # Built from crates.io rather than piped from a release tarball into /usr/local/bin.
+        # That pipe applied NO checksum or signature check, so anyone able to serve or tamper
+        # with the URL dropped an arbitrary executable onto the PATH of the job that renders
+        # the published install/security docs. install.sh refuses to install without a
+        # verified checksum; this toolchain now meets the same bar. cargo verifies each
+        # downloaded .crate against the registry index checksum, and --locked builds mdBook's
+        # own committed lockfile so the dependency set is fixed too.
+        #
+        # This still runs mdBook's build scripts and proc-macros, which is why the token
+        # side matters as much as the integrity side: that code now sees only contents:read
+        # and no OIDC endpoint, so the worst it reaches is a book render it cannot publish.
+        run: cargo install --locked mdbook --version 0.4.40
+      - name: Build book
+        run: mdbook build book
+      # Uploading the artifact needs no repo permission: it goes to the run's artifact
+      # store with the runner's own token, not GITHUB_TOKEN. So the rendered book leaves
+      # this job without the job ever being able to publish it.
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: book/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    # The publishing half, and the ONLY place these two live. `deploy-pages` exchanges an
+    # OIDC token for the deployment credential (id-token) and `configure-pages --enablement`
+    # calls the Pages API (pages). This job runs no third-party code: two GitHub actions,
+    # no dependency tree, nothing that could carry a hostile build script.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Moved out of `build`: --enablement needs pages:write, and granting that to the job
+      # that compiles ~200 crates.io build scripts is precisely what this workflow is
+      # avoiding. It only has to run before the deploy, not before the render (mdBook takes
+      # no base_url from it).
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+        # Enable the Pages site on first run instead of 404-ing when it was never
+        # configured in the repo settings. Requires the repo to be Pages-eligible
+        # (public, or private on a paid plan) — see the deploy note in the README.
+        with:
+          enablement: true
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

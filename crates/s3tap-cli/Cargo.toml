@@ -1,0 +1,33 @@
+[package]
+name = "s3tap"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "s3tap"
+path = "src/main.rs"
+
+[dependencies]
+s3tap-events = { path = "../s3tap-events" }   # typed event mirrors + decode
+s3tap-core = { path = "../s3tap-core" }       # connect/close -> Connection
+s3tap-schema = { path = "../s3tap-schema" }   # the public Connection record
+s3tap-doctor = { path = "../s3tap-doctor" }
+s3tap-advisor = { path = "../s3tap-advisor" }   # `advise` subcommand (pure consumer)
+aya = "0.13"          # eBPF loader/reader
+# Process credentials (geteuid/getuid/getgroups) for the borrowed-privilege checks,
+# access(2) + openat/unlinkat for the --save/--auth path guards, and raise() in tests.
+libc = "0.2"
+# rt+macros: current-thread runtime & #[tokio::main]; net: AsyncFd to await the
+# ring buffer fd instead of polling; signal: Ctrl-C / SIGTERM graceful shutdown;
+# time: the periodic filter_pids reap interval (M4 F2).
+tokio = { version = "1", features = ["rt", "macros", "signal", "net", "time"] }
+anyhow = "1"          # easy error handling while learning
+clap = { version = "4", features = ["derive"] }   # CLI flags
+serde_json = "1"      # jsonl record output
+# minimal chrono: just the wall clock + formatting for emitted_at (RFC3339).
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

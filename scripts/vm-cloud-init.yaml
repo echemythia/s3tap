@@ -1,0 +1,37 @@
+#cloud-config
+# Provisioning for the s3tap load-test VM (used by scripts/vm-provision.sh).
+# Preinstalls everything vm-loadtest.sh needs so the guest lands ready to
+# `git clone && ./scripts/vm-loadtest.sh`.
+#
+# Login is SSH-key only: vm-provision.sh appends an `ssh_authorized_keys:` block
+# to a temp copy of this file, injecting your host public key into the default
+# `ubuntu` user. No password auth on this disposable local VM.
+
+# The package list is the guest half of the README's "Requirements" section and of what
+# every CI workflow installs. Keep the three in step: a package that drifts out of here
+# does not fail at provision time, it fails much later as a confusing `cargo build` error
+# inside the VM.
+package_update: true
+packages:
+  - build-essential   # cc/linker for the Rust build
+  - clang             # compiles the embedded eBPF object (build.rs)
+  - llvm              # llvm-strip, which build.rs runs on the object to drop DWARF
+  - libbpf-dev        # <bpf/bpf_helpers.h>, included by bpf/src/s3tap.bpf.c
+  - linux-tools-generic  # a real bpftool: dumps the kernel BTF into bpf/vmlinux/vmlinux.h,
+                         # which is gitignored and so absent from a fresh clone. 24.04 has
+                         # no standalone `bpftool` package and the version-matching wrapper
+                         # finds no binary for the cloud kernel, so name -generic (bpftool
+                         # works via syscalls, its version need not match the running kernel).
+  - just              # every documented entry point is a `just` recipe (build/test/bpf*)
+  - libcap2-bin       # getcap/setcap
+  - awscli            # drives real S3 traffic in the load test
+  - git
+  - curl
+  - pkg-config
+
+runcmd:
+  # Install a Rust toolchain for the default `ubuntu` user (rustup isn't an apt package).
+  - [ bash, -lc, "su - ubuntu -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'" ]
+  - [ bash, -lc, "echo 'source $HOME/.cargo/env' >> /home/ubuntu/.bashrc" ]
+
+final_message: "s3tap load-test VM ready (cloud-init finished in $UPTIME s). SSH in as ubuntu@<vm-ip>."

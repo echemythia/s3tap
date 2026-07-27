@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/s3tap-cli", "crates/s3tap-events", "crates/s3tap-schema", "crates/s3tap-core", "crates/s3tap-doctor", "crates/s3tap-replay",
+    "crates/s3tap-advisor"]
+
+# Shared package metadata the member crates inherit via `field.workspace = true`.
+# The userspace crates are Apache-2.0; the loaded eBPF object separately declares
+# GPL in-source (a kernel-load requirement) — see LICENSE and the README.
+[workspace.package]
+version = "0.7.0"
+license = "Apache-2.0"
+repository = "https://github.com/echemythia/s3tap"
+description = "Observe and judge an application's S3 traffic from outside the process with eBPF"
+keywords = ["ebpf", "s3", "observability", "aws", "tcp"]
+categories = ["command-line-utilities", "network-programming"]

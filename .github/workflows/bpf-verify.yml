@@ -1,0 +1,88 @@
+name: bpf-verify
+
+# Load the compiled eBPF object so the KERNEL VERIFIER runs on it — the check
+# `cargo test` (in ci.yml) cannot do, since the verifier only runs at load time.
+#   * verifier-gate: every push/PR, on the runner's own kernel (a real single-
+#     kernel gate that catches most verifier regressions).
+#   * kernel-matrix: on demand, across several kernels via vmtest (CO-RE
+#     portability — the coverage a fixed CI kernel can't give).
+on:
+  push:
+    # Same branch set as ci.yml. A release branch that carries an eBPF change must face the
+    # verifier too: it is the only gate that runs the program through the kernel at all.
+    branches: [main, 'release-*']
+    paths: ["bpf/**", "scripts/kernel-compat/**", ".github/workflows/bpf-verify.yml"]
+  pull_request:
+    branches: [main, 'release-*']
+    paths: ["bpf/**", "scripts/kernel-compat/**", ".github/workflows/bpf-verify.yml"]
+  workflow_dispatch:
+
+# Least privilege: this workflow only reads the tree. Declaring nothing would inherit the
+# repo default, which can be read/write. (No third-party actions here to pin — only
+# `actions/*`, which is GitHub's own org, served by the infrastructure running the job.)
+permissions:
+  contents: read
+
+concurrency:
+  group: bpf-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verifier-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install clang + bpftool
+        # Noble (24.04) dropped the standalone `bpftool` package; the version-
+        # matching wrapper can't find a binary for the runner's azure kernel, so
+        # install linux-tools-generic (always ships a real bpftool). bpf-verify.sh
+        # discovers it under /usr/lib/linux-tools/*/bpftool.
+        run: sudo apt-get update && sudo apt-get install -y clang llvm linux-tools-generic libbpf-dev
+      - name: Load the eBPF object (verifier runs on the runner kernel)
+        # bpf-verify.sh generates vmlinux.h from the runner's BTF, compiles the
+        # object, and `bpftool prog loadall`s it — sudo gives CAP_BPF/CAP_SYS_ADMIN.
+        run: ./scripts/kernel-compat/bpf-verify.sh
+
+  # Multi-kernel portability (CO-RE): the ONLY thing that proves the one compiled object
+  # loads across the supported kernel range, which a single fixed CI kernel cannot show.
+  #
+  # It is workflow_dispatch ONLY, so it is NOT a per-PR gate, and that is a deliberate
+  # limitation to know about rather than a bug: it boots a VM per kernel (minutes each) and
+  # needs working hardware virtualization. On GitHub-hosted Linux runners /dev/kvm exists but
+  # is NOT accessible to the runner user by default, so the udev rule below is what makes the
+  # difference between a real KVM run and a silent fall back to software emulation that would
+  # make the whole matrix slow and flaky. The check afterwards is read/write, not existence:
+  # a matrix that cannot use KVM must fail loudly here rather than time out an hour later.
+  # A change to bpf/** is gated on the SINGLE-kernel verifier job above; run this matrix by
+  # hand (or locally, `just bpf-matrix`) before moving the supported-kernel floor.
+  kernel-matrix:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain (clang, bpftool, virtme-ng, qemu)
+        # virtme-ng downloads each kernel itself and boots it with an initramfs
+        # that loads the modular 9p/virtio drivers (distro kernels ship them as
+        # modules), so — unlike vmtest — the guests actually boot.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm linux-tools-generic libbpf-dev qemu-system-x86 virtme-ng
+      - name: Check KVM
+        run: |
+          # Grant the runner user access to /dev/kvm (it is root:kvm 0660 out of the box).
+          # Best-effort: if the runner has no /dev/kvm at all, the hard check below is what
+          # reports it, with the reason.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null || true
+          sudo udevadm control --reload-rules || true
+          sudo udevadm trigger --name-match=kvm || true
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "KVM usable"
+          else
+            ls -l /dev/kvm 2>&1 || true
+            echo "::error::/dev/kvm is not readable+writable here. The kernel matrix needs real"
+            echo "::error::hardware virtualization; under software emulation it is too slow to finish."
+            exit 1
+          fi
+      - name: Run the verifier gate across the kernel matrix
+        run: ./scripts/kernel-compat/bpf-matrix.sh

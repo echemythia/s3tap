@@ -1,0 +1,15 @@
+/target
+bpf/vmlinux/vmlinux.h
+*.bpf.o
+# Local trace datasets (multi-GB IBM COS / SNIA files) — never commit these.
+/traces/
+
+# mdBook build output (docs site)
+/book/book/
+
+# Kernel images fetched for the vmtest matrix (large; not tracked)
+kernels/
+
+# Maintainer-local coding guidelines (kept out of the repo deliberately).
+CLAUDE.md
+AGENTS.md

@@ -1,0 +1,167 @@
+name: ci
+
+# Build, test, and lint the workspace on every push/PR to main or a release
+# branch. This also compiles the eBPF object: the CLI crate's build.rs invokes
+# clang, so a build here is a real compile-check of bpf/src/s3tap.bpf.c (it does
+# NOT load it — the kernel verifier only runs at load time, which needs a
+# privileged host).
+#
+# The eBPF C's behaviour is judged by the `bpf-parser-tests` job below, which
+# runs its pure byte parsers against constructed inputs on the host. Compiling
+# and loading are both necessary and neither is sufficient: see that job's
+# comment for why a green kernel matrix is not a correctness claim.
+on:
+  push:
+    branches: [main, 'release-*']
+  pull_request:
+    branches: [main, 'release-*']
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default: nothing here needs to write to the repo. A workflow that
+# declares no `permissions:` inherits the repo default, which can be read/write.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Third-party actions are pinned to a full commit SHA, not a tag. A tag is mutable: whoever
+# can move it (upstream compromise, maintainer account takeover) would otherwise run their
+# code inside our jobs. The trailing comment records which version each SHA is, so a bump
+# stays reviewable. `actions/*` is GitHub's own org, served by the same infrastructure that
+# runs the job, so pinning it buys nothing and is left on the major tag.
+
+jobs:
+  # Unit tests for the eBPF program's byte parsers. Deliberately its OWN job, and
+  # deliberately first: it needs nothing but clang — no kernel, no root, no VM, no
+  # Rust toolchain, no vmlinux.h — so it finishes in seconds and fails fast.
+  #
+  # This is the only gate here that judges the eBPF C for CORRECTNESS. The build
+  # below merely compiles it, and even the kernel matrix (`just bpf-matrix`, run
+  # out-of-band) only proves the object LOADS: the verifier walks REACHABLE code
+  # only, so a CO-RE relocation that returns early turns everything downstream
+  # into dead code it never examines and a PASS stops being distinguishable from
+  # "compiled out". The parsers covered here read attacker-influenced bytes (DNS
+  # messages, TLS ClientHello/ServerHello, HTTP heads), so they are the part that
+  # most needs a real test and the part a load gate covers least.
+  bpf-parser-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install clang
+        # The sanitizers are a bonus here, not the load-bearing part: over-reads
+        # are caught by guard pages, which need no runtime. If the ASan/UBSan
+        # runtime is missing the script says so and carries on.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+      - name: eBPF parser unit tests
+        run: ./scripts/bpf-parser-tests.sh
+
+  # The attribution file ships with every binary, so it must not drift from Cargo.lock.
+  # Regenerating and diffing is the only check that cannot go stale: a dependency added
+  # without re-running the generator fails here rather than shipping an incomplete notice.
+  third-party-notices:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Regenerate and diff
+        run: |
+          ./scripts/gen-third-party-notices.sh
+          git diff --exit-code THIRD-PARTY-NOTICES.md || {
+            echo "::error::THIRD-PARTY-NOTICES.md is out of date — run ./scripts/gen-third-party-notices.sh"
+            exit 1; }
+
+  build-test-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # eBPF toolchain: clang compiles the object. vmlinux.h is deliberately NOT committed
+      # (see .gitignore); it is dumped fresh from this runner's own BTF below, every run.
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update
+          # Noble (24.04) dropped the standalone `bpftool` package. The version-
+          # matching wrapper (linux-tools-common) can't find a binary for the
+          # runner's fast-moving azure kernel, so install linux-tools-generic —
+          # it always ships a real bpftool. Version needn't match the running
+          # kernel: bpftool works via syscalls regardless.
+          # libbpf-dev provides <bpf/bpf_helpers.h>, included by the BPF source.
+          sudo apt-get install -y clang llvm linux-tools-generic libbpf-dev
+      - name: Resolve the CO-RE type header (vmlinux.h)
+        run: |
+          # NEVER committed, by design (see .gitignore):
+          # every kernel-version-specific member name lives in a CO-RE flavour struct
+          # precisely so `cargo build` compiles against THIS host's own BTF and a member-
+          # name drift is a build failure here, not a silently wrong probe shipped to an
+          # older distro (`build.rs` compiles with `-Werror`). A single frozen, committed
+          # header would defeat that check. Portability across the supported kernel range
+          # is what `just bpf-matrix` proves, not pinning one host's header.
+          mkdir -p bpf/vmlinux
+          bpftool="$(ls -1 /usr/lib/linux-tools/*/bpftool | sort -V | tail -1)"
+          sudo "$bpftool" btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux/vmlinux.h
+
+      - name: Rust toolchain (stable + clippy)
+        run: rustup component add clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (v2.9.1)
+
+      - name: Build (compiles + embeds the eBPF object)
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # Clippy is a hard gate: any warning fails the build.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # Line coverage, uploaded to Codecov for the README badge. Kept separate from the gate
+  # so a coverage hiccup never fails CI. Root-only paths (the eBPF capture loop and
+  # setcap) cannot run here and are covered by the VM selftest + kernel matrix instead.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm linux-tools-generic libbpf-dev
+      - name: Resolve the CO-RE type header (vmlinux.h)
+        run: |
+          # NEVER committed, by design (see .gitignore):
+          # every kernel-version-specific member name lives in a CO-RE flavour struct
+          # precisely so `cargo build` compiles against THIS host's own BTF and a member-
+          # name drift is a build failure here, not a silently wrong probe shipped to an
+          # older distro (`build.rs` compiles with `-Werror`). A single frozen, committed
+          # header would defeat that check. Portability across the supported kernel range
+          # is what `just bpf-matrix` proves, not pinning one host's header.
+          mkdir -p bpf/vmlinux
+          bpftool="$(ls -1 /usr/lib/linux-tools/*/bpftool | sort -V | tail -1)"
+          sudo "$bpftool" btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux/vmlinux.h
+      - name: Rust toolchain (llvm-tools)
+        run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (v2.9.1)
+      # Was `@cargo-llvm-cov`, a per-tool convenience tag that only sets this action's
+      # default `tool` input — and moves on every release. Pinned to the versioned release
+      # SHA with the tool named explicitly, which is equivalent and reviewable.
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage (lcov)
+        # Exclude the s3tap-replay research/eval binaries (src/bin/*): manual analysis
+        # harnesses, not part of the shipped `s3tap` tool.
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info --ignore-filename-regex 'src/bin/.*'
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

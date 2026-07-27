@@ -1,0 +1,283 @@
+name: release
+
+# Build static, self-contained `s3tap` binaries and attach them to the GitHub
+# Release for a `v*` tag. s3tap embeds its eBPF object at build time and that
+# object is CO-RE-relocatable, so ONE binary per CPU arch runs across kernels
+# (>= 5.8 with BTF). Each arch is built NATIVELY so build.rs picks the right
+# __TARGET_ARCH for the BPF object and the musl toolchain is native, with no
+# cross-compilation.
+#
+# Builds x86_64 and aarch64. Hosted arm64 runners are free for public repositories, which
+# this is, so both come off GitHub-hosted runners with no cross-compilation.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish assets for (e.g. v0.7.0)"
+        required: true
+
+# Least privilege by default. The one job that publishes asks for more, below.
+permissions:
+  contents: read
+
+# Third-party actions are pinned to a full commit SHA, not a tag. This job holds
+# contents:write and produces the artifact `install.sh` downloads, so anyone who could move
+# a tag we referenced could replace BOTH the published binary and its .sha256 — the
+# installer would then verify the attacker's binary against the attacker's digest and print
+# "checksum ok". The trailing comment records which version each SHA is. `actions/*` is
+# GitHub's own org, served by the same infrastructure that runs the job, so it generally
+# stays on the major tag. The exception is any action whose step handles a token that can
+# SIGN or PUBLISH what users download: attest-build-provenance holds id-token:write and is
+# the root of the only check a third party can make, so it is pinned like a third party.
+
+# One release run per tag. If the same tag is re-pushed (e.g. force-moved), supersede the
+# older, now-stale run instead of racing it — two concurrent runs both uploading assets is
+# how a tag ends up with assets from two different builds. Different tags are different groups, so they never
+# cancel each other. (The raw input is fine HERE: workflow-level `concurrency` is an
+# expression context evaluated by the runner, not a shell body — the validated $TAG isn't
+# available yet, and the worst a bad value does is name a group nothing else uses.)
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      # `contents: read` — the build job no longer creates or attaches anything; the single
+      # `publish` job below owns the release and holds the only `contents: write` in this
+      # workflow. Least privilege, and it makes the race that split one release into two
+      # structurally impossible rather than merely unlikely.
+      contents: read
+      id-token: write # mint the OIDC identity the provenance attestation is signed with
+      attestations: write # record that attestation against this repository
+    steps:
+      # Resolve the tag ONCE, before anything else touches it, and refuse anything that
+      # isn't a plain vMAJOR.MINOR.PATCH. The workflow_dispatch input is free text from
+      # whoever dispatched the run, and GitHub substitutes `${{ … }}` TEXTUALLY into a
+      # `run:` body before bash ever parses it — so an unvalidated `v0.7.0"; curl …|sh; #`
+      # would execute in a job holding contents:write. Reading it from the environment
+      # (bash never re-parses "$INPUT_TAG") plus the format gate closes both halves. Every
+      # later step uses $TAG / env.TAG, never the raw expression.
+      - name: Resolve and validate the release tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          tag="${INPUT_TAG:-$REF_NAME}"
+          # bash `[[ =~ ]]`, NOT `grep -E`: grep matches line by line, so `^…$` would happily
+          # accept a two-line value like $'v0.7.0\nTAG=…' — which then writes a SECOND line
+          # into $GITHUB_ENV and lets the dispatcher set any environment variable in every
+          # later step. Bash anchors against the whole string, so a newline can't get through.
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::refusing to release '$tag': expected vMAJOR.MINOR.PATCH"; exit 1; }
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Checkout (the tag being released)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+
+      # The tag decides BOTH which tree is built and which changelog section becomes the
+      # release notes, but nothing tied either to the version the binary reports. Tagging a
+      # tree whose workspace version was never bumped therefore ships a binary saying 0.7.0
+      # under a v0.7.1 release, with notes extracted from a section that may not exist —
+      # silently empty rather than failed. Check it here, where the tag and the tree are both
+      # in hand, and fail loudly instead.
+      - name: Tag matches the workspace version and has changelog notes
+        run: |
+          want="${TAG#v}"
+          got="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -1)"
+          [ -n "$got" ] || { echo "::error::could not read the workspace version from Cargo.toml"; exit 1; }
+          [ "$want" = "$got" ] || {
+            echo "::error::tag $TAG does not match the workspace version $got — bump Cargo.toml or retag"; exit 1; }
+          grep -qE "^## \[?${want//./\\.}\]?" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no section for $want — the release notes would be empty"; exit 1; }
+
+      - name: Install build tools (clang, llvm, bpftool, musl)
+        run: |
+          sudo apt-get update
+          # `bpftool` is a virtual apt package on 24.04 (shipped inside linux-tools-*).
+          # Install linux-tools-generic — it ALWAYS ships a real bpftool binary (bpftool
+          # works via syscalls, so its version needn't match the running kernel). Do NOT
+          # prefer linux-tools-$(uname -r): on the runner's azure kernel that lands as a
+          # symlinked dir (…/6.17.0-1020-azure -> ../linux-azure-6.17-tools-…) which a
+          # `find -type f` walk won't descend into, leaving no runnable binary. libbpf-dev
+          # provides <bpf/bpf_helpers.h>, included by the BPF source build.rs compiles.
+          # clang / llvm-strip can be version-suffixed, so resolve each tool path below.
+          sudo apt-get install -y --no-install-recommends clang llvm musl-tools linux-tools-generic libbpf-dev
+          clang_bin="$(command -v clang || ls -1 /usr/bin/clang-* 2>/dev/null | sort -V | tail -1)"
+          strip_bin="$(command -v llvm-strip || ls -1 /usr/bin/llvm-strip-* 2>/dev/null | sort -V | tail -1)"
+          # Enumerate real bpftool binaries via the glob (shell follows symlinks, unlike
+          # `find -type f`) and pick the newest that actually RUNS.
+          bpftool_bin=""
+          for c in $(ls -1 /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -V -r); do
+            if "$c" version >/dev/null 2>&1; then bpftool_bin="$c"; break; fi
+          done
+          echo "clang=$clang_bin  llvm-strip=$strip_bin  bpftool=$bpftool_bin"
+          if [ -z "$bpftool_bin" ]; then
+            echo "no working bpftool found; diagnosis:"
+            dpkg -L linux-tools-generic 2>/dev/null | grep -i bpftool || true
+            ls -la /usr/lib/linux-tools/* /usr/sbin/bpftool 2>/dev/null || true
+            exit 1
+          fi
+          test -x "$clang_bin" && test -x "$strip_bin"
+          { echo "CLANG=$clang_bin"; echo "LLVM_STRIP=$strip_bin"; echo "BPFTOOL=$bpftool_bin"; } >> "$GITHUB_ENV"
+
+      # NEVER committed, by design (see .gitignore):
+      # every kernel-version-specific member name lives in a CO-RE flavour struct so
+      # `cargo build` (which runs with `-Werror`) fails outright on a host whose BTF
+      # lacks a name the code references, rather than silently shipping a probe that
+      # would be wrong on that distro. A single frozen, committed header defeats that
+      # check entirely. The relocations this buys are resolved against the TARGET
+      # kernel's BTF at LOAD time (that is the whole point of CO-RE), so the object
+      # this step produces is functionally the same regardless of which supported
+      # runner kernel built it; portability across the supported range is what
+      # `just bpf-matrix` proves, not pinning one build host's header.
+      - name: Resolve the CO-RE type header (vmlinux.h)
+        run: |
+          test -r /sys/kernel/btf/vmlinux || { echo "runner kernel has no BTF; cannot build"; exit 1; }
+          mkdir -p bpf/vmlinux
+          sudo "$BPFTOOL" btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux/vmlinux.h
+          test -s bpf/vmlinux/vmlinux.h
+
+      - name: Rust toolchain (stable + musl target)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Build (musl, fully static)
+        # CLANG / LLVM_STRIP come from the resolved paths exported above (via GITHUB_ENV).
+        run: cargo build --release --locked -p s3tap --target ${{ matrix.target }}
+
+      - name: Stage the binary + checksum
+        run: |
+          # Friendly asset name (s3tap-linux-x86_64), decoupled from the Rust target triple
+          # used to build it (x86_64-unknown-linux-musl). The `unknown` vendor slot in the
+          # triple reads oddly for users, so publish the human name.
+          out="s3tap-linux-${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/s3tap" "$out"
+          strip "$out" || true
+          sha256sum "$out" > "$out.sha256"
+          file "$out" || true
+          ls -la "$out"
+
+      # Pull the notes for THIS version out of CHANGELOG.md so the release body is never
+      # empty. Grabs everything under `## [x.y.z]` up to the next version header, dropping
+      # the header itself and the link-reference footers. Fails loudly if the version has no
+      # section — an empty-notes release is a mistake, not something to publish silently.
+      - name: Extract release notes from CHANGELOG
+        run: |
+          ver="${TAG#v}"
+          awk -v ver="$ver" '
+            $0 ~ "^## \\[" ver "\\]" {grab=1; next}
+            grab && /^## \[/ {exit}
+            grab && /^\[.*\]: / {next}
+            grab {print}
+          ' CHANGELOG.md | sed -e '/./,$!d' > RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md || { echo "::error::no CHANGELOG section for $ver"; exit 1; }
+          echo "----- release notes for $ver -----"; cat RELEASE_NOTES.md
+
+      # Sign a build provenance statement over the EXACT bytes about to be uploaded (after
+      # the strip, so the subject digest is the digest install.sh computes). This is the
+      # only verification a third party can make that does not reduce to trusting whoever
+      # can write release assets: the .sha256 is served from the same release as the binary,
+      # so a leaked contents:write token, an account takeover or a hostile workflow_dispatch
+      # replaces both and the installer still prints "checksum ok". The attestation is
+      # signed through Sigstore with an OIDC identity GitHub mints for THIS job, binding the
+      # bytes to this repo, this workflow file and this commit. install.sh verifies it with
+      # `gh attestation verify --repo … --signer-workflow …`.
+      #
+      # It runs BEFORE the upload on purpose: an attestation that fails must stop the
+      # release, not leave an unattested binary published that install.sh would then refuse.
+      #
+      # SKIPPED WHILE THE REPOSITORY IS PRIVATE, because GitHub does not offer the
+      # attestations API for user-owned private repos: the step fails with "Feature not
+      # available for user-owned private repositories", which fails the release rather than
+      # producing anything. The condition is on visibility rather than a blanket
+      # `continue-on-error` so the check stays MANDATORY the moment the repo is public —
+      # a silently optional attestation is the same as none. A release cut while private is
+      # genuinely unattested, and `install.sh` still refuses it by default: reaching a
+      # checksum-only install takes an explicit `S3TAP_ATTESTATION=skip` from the operator.
+      - name: Attest build provenance
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: s3tap-linux-${{ matrix.arch }}
+
+      - name: Note the missing attestation
+        if: github.event.repository.visibility != 'public'
+        run: |
+          echo "::warning::Repository is ${{ github.event.repository.visibility }}, so no build \
+          provenance attestation was produced. This release is verifiable by checksum only, and \
+          install.sh will refuse it unless the operator passes S3TAP_ATTESTATION=skip."
+
+      # Hand the artifacts to the single publish job below rather than creating the release
+      # here. Every matrix job doing its own create/update RACES: with two architectures the
+      # second job found the release "not yet discoverable by tag", created a SECOND release
+      # for the same tag, uploaded into it, and then failed to finalize with
+      # `already_exists: tag_name` — leaving one visible release holding half the binaries and
+      # a hidden draft holding the other half. Invisible with one architecture; guaranteed
+      # with two.
+      - name: Hand the artifacts to the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ matrix.arch }}
+          path: |
+            s3tap-linux-${{ matrix.arch }}
+            s3tap-linux-${{ matrix.arch }}.sha256
+            THIRD-PARTY-NOTICES.md
+            RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 1
+
+  # ONE job, so the release is created exactly once no matter how many architectures build.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Collect every architecture's artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Show what will be published
+        run: |
+          ls -l dist
+          # Both architectures ship an identical copy of these two; one is enough, and their
+          # being identical is worth asserting rather than assuming.
+          test -s dist/RELEASE_NOTES.md
+          test -s dist/THIRD-PARTY-NOTICES.md
+          for a in x86_64 aarch64; do
+            test -s "dist/s3tap-linux-$a" || { echo "::error::missing dist/s3tap-linux-$a"; exit 1; }
+            test -s "dist/s3tap-linux-$a.sha256" || { echo "::error::missing checksum for $a"; exit 1; }
+          done
+
+      - name: Publish the GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          body_path: dist/RELEASE_NOTES.md
+          files: |
+            dist/s3tap-linux-x86_64
+            dist/s3tap-linux-x86_64.sha256
+            dist/s3tap-linux-aarch64
+            dist/s3tap-linux-aarch64.sha256
+            dist/THIRD-PARTY-NOTICES.md

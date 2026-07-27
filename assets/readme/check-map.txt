@@ -1,0 +1,22 @@
+s3tap check: regional S3 round-trip probe across 8 region(s) — a 403 is expected (no bucket/creds); this measures the network path, not access, and is NOT a verdict on any bucket. (Needs the base caps: `sudo s3tap setup`.)
+──── S3 latency map · 8 regions ────────────────────
+  region          round-trip    jitter  vs nearest  location
+  eu-west-1          14.2 ms   ±2.5 ms           —  Ireland · ~regional   ← nearest
+  eu-central-1       16.7 ms   ±2.1 ms     +  2 ms  Frankfurt · ~regional
+  us-east-1          78.7 ms   ±8.0 ms     + 65 ms  N. Virginia · ~long-haul
+  ap-south-1        127.4 ms   ±9.3 ms     +113 ms  Mumbai · ~global
+  ap-southeast-1    158.8 ms  ±15.2 ms     +145 ms  Singapore · ~global
+  us-west-2         159.3 ms  ±15.0 ms     +145 ms  Oregon · ~global
+  sa-east-1         198.5 ms  ±18.2 ms     +184 ms  São Paulo · ~global
+  ap-northeast-1    238.4 ms  ±16.5 ms     +224 ms  Tokyo · ~global
+
+──── where you sit ─────────────────────────────────
+  nearest    eu-west-1 · 14.2 ms
+             (of those probed; an un-probed region may be nearer)
+  stability  ±2.5 ms jitter at eu-west-1 — variable path
+  runner-up  eu-central-1 · +2.5 ms
+  redundancy 2 regions within ~5 ms — failover/replica option
+             (replication adds cost and is eventually consistent)
+  spread     +224 ms at ap-northeast-1 · single-stream ceiling ~17× lower
+             (ceiling ≈ window ÷ RTT; only when window-limited — parallel connections help)
+  advice     latency-sensitive buckets → consider eu-west-1
