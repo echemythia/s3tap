@@ -45,6 +45,13 @@ concurrency:
 
 jobs:
   build:
+    # The validated tag, republished for `publish` below. Every matrix job resolves it from
+    # the same two inputs by the same rule, so they all write the identical string and
+    # last-writer-wins is not a race. Reading it here rather than re-deriving it downstream
+    # is the point: `github.ref_name` is the ref the run was DISPATCHED from, which on a
+    # workflow_dispatch is a branch, not the tag whose tree was built and attested.
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +80,7 @@ jobs:
       # (bash never re-parses "$INPUT_TAG") plus the format gate closes both halves. Every
       # later step uses $TAG / env.TAG, never the raw expression.
       - name: Resolve and validate the release tag
+        id: resolve
         env:
           INPUT_TAG: ${{ github.event.inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
@@ -84,7 +92,11 @@ jobs:
           # later step. Bash anchors against the whole string, so a newline can't get through.
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
             echo "::error::refusing to release '$tag': expected vMAJOR.MINOR.PATCH"; exit 1; }
+          # Both sinks, and both are safe for the same reason: the format gate above ran
+          # first, so $tag cannot carry the newline that would let a dispatcher append a
+          # second `KEY=value` line to either file.
           echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Checkout (the tag being released)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -259,8 +271,21 @@ jobs:
           merge-multiple: true
 
       - name: Show what will be published
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
         run: |
           ls -l dist
+          # Catch broken output plumbing on the trigger that would otherwise HIDE it. Given an
+          # empty tag_name, action-gh-release throws only when GITHUB_REF isn't a tag; on this
+          # workflow's own `push: tags: v*` trigger it quietly falls back to the pushed ref, so a
+          # release would still publish, correctly, and the breakage would surface only later on a
+          # dispatched run. (It never falls back to a BRANCH name: it reads the full GITHUB_REF and
+          # discards anything without a refs/tags/ prefix. action.yml's "Defaults to github.ref_name"
+          # is loose — the code cannot name a release after a branch.) Re-assert the format here, in
+          # the job that actually holds contents:write.
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::publish got no valid tag from the build job (got '$TAG')"; exit 1; }
+          echo "publishing as $TAG"
           # Both architectures ship an identical copy of these two; one is enough, and their
           # being identical is worth asserting rather than assuming.
           test -s dist/RELEASE_NOTES.md
@@ -273,7 +298,14 @@ jobs:
       - name: Publish the GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          tag_name: ${{ github.ref_name }}
+          # The tag the build VALIDATED and checked out — not `github.ref_name`, which on a
+          # dispatched run is the branch the run was started from. Using the ref attached every
+          # asset to a release named `main` while the bytes came from the tag.
+          # NOT "attested": the provenance predicate takes its ref/sha from the run's OIDC claims,
+          # so a run dispatched FROM a branch signs that branch's ref and HEAD however the tree was
+          # checked out. Dispatch from the tag itself (`gh workflow run release.yml --ref vX.Y.Z`,
+          # which the ${INPUT_TAG:-$REF_NAME} fallback above already handles) to keep it honest.
+          tag_name: ${{ needs.build.outputs.tag }}
           body_path: dist/RELEASE_NOTES.md
           files: |
             dist/s3tap-linux-x86_64
